@@ -1,0 +1,304 @@
+  MODULE lswind_nudge_module
+
+  ! code for large-scale wind nudging
+
+  implicit none
+
+  public
+
+  ! use large-scale wind nudging?
+
+    logical, parameter ::  do_lswind_nudge  =  .true.    ! .true. = yes, use large-scale wind nudging
+                                                         ! .false. = no, do not use large-scale wind nudging
+
+  ! these variables can be adjusted:
+  ! RRB: sending these parameters to the namelist !
+!    real ::  lswind_nudge_tau =  var1   ! time scale (seconds) for damping
+
+
+    ! NOTE:  CM1 only applies large-scale wind nudging when t > lswind_nudge_start and 
+    !        t < lswind_nudge_end;  the user must set these two variables below.  For any other 
+    !        times, large-scale wind nudging is not applied, regardless of the times provided 
+    !        for lswind_nudge_time1 and lswind_nudge_time2 in the lswind_nudge_xxxx.dat files.
+
+!    real ::  lswind_nudge_start = var2   ! time (seconds) to begin large-scale nudging
+
+!    real ::  lswind_nudge_end =   var3   ! time (seconds) to end large-scale nudging
+
+
+  ! use adaptive domain-moving option?
+  !
+  !      (experimental!)
+
+    logical, parameter ::  do_adapt_move  =  .true.    ! .true. = yes, adaptively "move" domain
+                                                       !          to keep TC near center of domain
+                                                       ! .false. = no, use fixed values from
+                                                       !          namelist (imove,umove,vmove)
+
+
+    real, parameter ::  adapt_move_frq  =  3600.0      ! frequency (seconds) to update umove/vmove
+                                                       ! when do_adapt_move = .true. 
+
+
+  ! Other Notes:
+  !
+  !   - CM1 expects to find a series of "large-scale wind" data files in the same
+  !     location as the cm1.exe file.  These must be named lswind_nudge_xxxx.dat, where 
+  !     "xxxx" denotes an integer (eg, 0001, 0002, 0003, etc).
+  !
+  !   - The contents of the lswind_nudge_xxx.dat files are rather simple:  a 1-line header with 
+  !     valid times for this wind profile, and the number of levels of data that follow
+  !     (# of levels arbitrary ... just make sure first level is at z=0.0, and last level is 
+  !     >= the depth of the model domain).  Subsequent lines list the z,u,v values of the 
+  !     sounding you want to nudge towards. 
+  !
+  !   - If you only provide one lswind_nudge file (lswind_nudge_0001.dat), then lswind_nudge_time1 
+  !     must be <= lswind_nudge_start, and lswind_nudge_time2 must be >= lswind_nudge_end.  
+  !
+
+
+  ! other variables (do not change):
+    integer :: lswind_nudge_unit,lswind_nudge_count,lswind_nudge_maxlevels
+    real :: lswind_nudge_time1,lswind_nudge_time2,lswind_nudge_tau,lswind_nudge_start,lswind_nudge_end
+
+  CONTAINS
+
+!ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+!ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+!ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+
+    subroutine read_lswind_nudge(lswind_nudge_unit,lswind_nudge_count,lswind_nudge_maxlevels,  &
+                                 lswind_nudge_time1,lswind_nudge_time2,lswind_nudge_u,lswind_nudge_v,  &
+                                 mtime,zh)
+    use input
+#ifdef MPI
+    use mpi
+#endif
+    implicit none
+
+    integer, intent(in) :: lswind_nudge_unit,lswind_nudge_maxlevels
+    integer, intent(inout) :: lswind_nudge_count
+    real, intent(inout) :: lswind_nudge_time1,lswind_nudge_time2
+    real, intent(inout), dimension(lswind_nudge_maxlevels) :: lswind_nudge_u,lswind_nudge_v
+    double precision, intent(in) :: mtime
+    real, intent(in), dimension(ib:ie,jb:je,kb:ke) :: zh
+
+    integer :: i,j,k,kk,kup,kdn,n,nloop,lswind_levels,iprint
+    real :: interp_frac,htime
+    character(len=60) :: fname
+    real, dimension(:), allocatable :: ztmp,utmp,vtmp
+    logical :: foundit
+
+  ! RRB: sending these parameters to the namelist !
+!    real ::  lswind_nudge_tau !=  var1   ! time scale (seconds) for damping
+
+
+    ! NOTE:  CM1 only applies large-scale wind nudging when t > lswind_nudge_start and 
+    !        t < lswind_nudge_end;  the user must set these two variables below.  For any other 
+    !        times, large-scale wind nudging is not applied, regardless of the times provided 
+    !        for lswind_nudge_time1 and lswind_nudge_time2 in the lswind_nudge_xxxx.dat files.
+
+!    real ::  lswind_nudge_start != var2   ! time (seconds) to begin large-scale nudging
+
+!    real ::  lswind_nudge_end !=   var3   ! time (seconds) to end large-scale nudging
+
+    iprint = 0
+#ifdef MPI
+    iprint = 2
+    call MPI_BARRIER (MPI_COMM_WORLD,ierr)
+#endif
+    if( myid.eq.iprint ) print *,'  iprint = ',iprint
+
+    allocate( ztmp(lswind_nudge_maxlevels) )
+    ztmp = 0.0
+    allocate( utmp(lswind_nudge_maxlevels) )
+    utmp = 0.0
+    allocate( vtmp(lswind_nudge_maxlevels) )
+    vtmp = 0.0
+
+    ! time in hours:
+    htime = mtime/3600.0
+
+    nloop = 0
+    foundit = .false.
+
+    doloop:  &
+    DO while( .not. foundit )
+
+      nloop = nloop+1
+      lswind_nudge_count = lswind_nudge_count+1
+
+      ! now get new variables (only processor 0 does this):
+      myid0:  &
+      if( myid.eq.0 )then
+
+        fname = 'lswind_nudge_XXXX.dat'
+        write(fname(14:17),101) lswind_nudge_count
+101     format(i4.4)
+
+        print *
+        print *,'  LSWIND: nloop,fname = ',nloop,fname
+
+        open(unit=lswind_nudge_unit,file=fname,status='old')
+
+        read(lswind_nudge_unit,*)
+        read(lswind_nudge_unit,*) lswind_nudge_time1,lswind_nudge_time2,lswind_levels
+        read(lswind_nudge_unit,*)
+
+        if( lswind_levels .gt. lswind_nudge_maxlevels )then
+          print *
+          print *,'  lswind_levels is too large '
+          print *
+          print *,'  ... stopping cm1 ... '
+          print *
+          call stopcm1
+        endif
+
+        print *,'  lswind_nudge_time1,lswind_nudge_time2,lswind_levels = ',lswind_nudge_time1,lswind_nudge_time2,lswind_levels
+        print *
+        print *,'  ztmp,utmp,vtmp: '
+
+        do k=1,lswind_levels
+          read(lswind_nudge_unit,*,err=8888,end=9999) ztmp(k),utmp(k),vtmp(k)
+          print *,ztmp(k),utmp(k),vtmp(k)
+        enddo
+
+        close(unit=lswind_nudge_unit)
+
+      endif  myid0
+
+#ifdef MPI
+      ! communicate the new variables to all processors:
+      call MPI_BCAST(lswind_levels,1,MPI_INTEGER,0,MPI_COMM_WORLD,ierr)
+      call MPI_BCAST(lswind_nudge_time1,1,MPI_REAL,0,MPI_COMM_WORLD,ierr)
+      call MPI_BCAST(lswind_nudge_time2,1,MPI_REAL,0,MPI_COMM_WORLD,ierr)
+      call MPI_BCAST(ztmp(1),lswind_levels,MPI_REAL,0,MPI_COMM_WORLD,ierr)
+      call MPI_BCAST(utmp(1),lswind_levels,MPI_REAL,0,MPI_COMM_WORLD,ierr)
+      call MPI_BCAST(vtmp(1),lswind_levels,MPI_REAL,0,MPI_COMM_WORLD,ierr)
+#endif
+
+
+      if( terrain_flag )then
+        if(myid.eq.0)then
+        print *
+        print *,'  cannot use lswind with terrain  '
+        endif
+#ifdef MPI
+        call MPI_BARRIER (MPI_COMM_WORLD,ierr)
+#endif
+        call stopcm1
+      endif
+
+
+    iffound:  &
+    IF( (htime.ge.lswind_nudge_time1 .and. htime.le.lswind_nudge_time2) .or. lswind_nudge_time1.ge.htime )THEN
+
+      foundit = .true.
+
+      ! interpolate to the actual model levels (all processors do this):
+
+      if( myid.eq.iprint ) print *
+      if( myid.eq.iprint ) print *,'  Interpolating to model grid: '
+
+      i = 1
+      j = 1
+
+      if( myid.eq.iprint ) print *
+      if( myid.eq.iprint ) print *,'  myid,zk-1,z,zk,interp_frac:'
+
+        DO k=1,nk
+
+          kk = 1
+          do while( ztmp(kk) .lt. zh(i,j,k) )
+            kk = kk+1
+          enddo
+          kdn = kk-1
+          kup = kk
+
+          IF( kdn.lt.1 )THEN
+
+            lswind_nudge_u(k) =  utmp(1)
+            lswind_nudge_v(k) =  vtmp(1)
+
+          ELSE
+
+            interp_frac = (   zh(1,1,k) - ztmp(kdn) )   &
+                        / ( ztmp( kup ) - ztmp(kdn) )
+
+            lswind_nudge_u(k) =  utmp(kdn) + ( utmp(kup)- utmp(kdn))*interp_frac
+            lswind_nudge_v(k) =  vtmp(kdn) + ( vtmp(kup)- vtmp(kdn))*interp_frac
+
+          ENDIF
+
+          
+          if(imove.eq.1)then
+            lswind_nudge_u(k) = lswind_nudge_u(k) - umove
+            lswind_nudge_v(k) = lswind_nudge_v(k) - vmove
+          endif
+
+          if(myid.eq.iprint) write(outfile,*) '       ',ztmp(kdn),zh(i,j,k),ztmp(kup),interp_frac
+
+        ENDDO
+
+      if( myid.eq.iprint ) print *
+      if( myid.eq.iprint ) print *,'  zh,lswind_nudge_u,lswind_nudge_v:'
+      if( myid.eq.iprint )then
+        do k=1,nk
+          print *,k,zh(1,1,k),lswind_nudge_u(k),lswind_nudge_v(k)
+        enddo
+      endif
+      if( myid.eq.iprint ) print *
+
+    ENDIF  iffound
+
+#ifdef MPI
+          call MPI_BARRIER (MPI_COMM_WORLD,ierr)
+#endif
+
+      if( nloop.ge.1000 )then
+        if( myid.eq.0 )then
+          print *
+          print *,'  nloop = ',nloop
+          print *
+          print *,'  Can not find appropriate lswind file.  Stopping cm1 .... '
+          print *
+        endif
+#ifdef MPI
+        call MPI_BARRIER (MPI_COMM_WORLD,ierr)
+#endif
+        call stopcm1
+      endif
+
+    ENDDO  doloop
+
+    ! all done
+
+
+    deallocate( ztmp )
+    deallocate( utmp )
+    deallocate( vtmp )
+
+
+    return
+
+8888 print *
+     print *,'  There was an error reading lswind_nudge_unit = ',lswind_nudge_unit
+     print *
+     print *,'  ... stopping cm1 ... '
+     print *
+     call stopcm1
+
+9999 print *
+     print *,'  Unexpectedly reached the end of lswind_nudge_unit = ',lswind_nudge_unit
+     print *
+     print *,'  ... stopping cm1 ... '
+     print *
+     call stopcm1
+
+    end subroutine read_lswind_nudge
+
+!ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+!ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+!ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+
+  END MODULE lswind_nudge_module

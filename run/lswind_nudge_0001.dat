@@ -1,0 +1,7 @@
+*  1-line Header:    lswind_nudge_time1 (s)   lswind_nudge_time2 (s)    lswind_levels (#)
+                          3600.0                    43200.0                    4
+*  Data:      z (m)    u (m/s)     v (m/s)
+                0.0       0.0         0.0
+             1000.0       0.0         0.0
+            10000.0      10.0         0.0
+            50000.0      10.0         0.0
